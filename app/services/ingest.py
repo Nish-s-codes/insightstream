@@ -1,5 +1,5 @@
 import fitz
-
+import re
 def extract_text(pdf_path):
     doc = fitz.open(pdf_path)
     text = ""
@@ -9,21 +9,20 @@ def extract_text(pdf_path):
 
     return text
 
+def chunk_text(text, chunk_size=700):
+    sentences = re.split(r'(?<=[.!?]) +', text)
 
-def chunk_text(text, chunk_size=1200, overlap=300):
     chunks = []
-    start = 0
+    current_chunk = ""
 
-    while start < len(text):
-        end = start + chunk_size
-        chunk = text[start:end]   # ✅ define chunk
+    for sentence in sentences:
+        if len(current_chunk) + len(sentence) < chunk_size:
+            current_chunk += " " + sentence
+        else:
+            chunks.append(current_chunk.strip())
+            current_chunk = sentence
 
-        # 🔥 FILTER BAD CHUNKS
-        if len(chunk.strip()) > 50:
-            if "disclaimer" not in chunk.lower():
-                if "credits" not in chunk.lower():
-                    chunks.append(chunk)   # ✅ append only once
-
-        start += chunk_size - overlap
+    if current_chunk:
+        chunks.append(current_chunk.strip())
 
     return chunks

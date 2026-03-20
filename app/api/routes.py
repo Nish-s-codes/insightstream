@@ -21,7 +21,6 @@ async def upload_file(file: UploadFile):
         "result": result
     }
     
-
 @router.get("/query")
 def query(q: str):
     return answer_question(q)

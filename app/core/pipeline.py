@@ -12,7 +12,7 @@ def process_document(file_path):
 
     embeddings = [get_embedding(chunk) for chunk in chunks]
 
-    store_embeddings(chunks, embeddings)
+    store_embeddings(chunks, embeddings, file_path)
 
     return {
         "num_chunks": len(chunks)

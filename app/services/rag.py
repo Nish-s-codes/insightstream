@@ -9,47 +9,82 @@ load_dotenv()
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
-def cosine_similarity(vec1, vec2):
-    vec1 = np.array(vec1)
-    vec2 = np.array(vec2)
-
-    return np.dot(vec1, vec2) / (np.linalg.norm(vec1) * np.linalg.norm(vec2))
 
 def answer_question(query: str):
-    # 1. embed query
-    enhanced_query = f"""
-    Find exact section or explanation for:
-    {query}
-     """
+    # 🔹 Detect broad query
+    broad_query = False
+    if "all" in query.lower() or "explain" in query.lower():
+        broad_query = True
 
-    query_embedding = get_embedding(enhanced_query)
+    # 1. Embed query
+    query_embedding = get_embedding(query)
 
-    # 2. retrieve relevant chunks
-    docs = query_embeddings(query_embedding)
+    # 2. Retrieve relevant chunks
+    results = query_embeddings(query_embedding)
 
-    if not docs or not docs[0]:
+    docs = results["documents"]
+    distances = results["distances"]
+
+    if not docs:
         return {"answer": "No relevant data found"}
 
-    context = " ".join(docs[0])
+    # 3. Filter + clean chunks
+    filtered_docs = []
+    filtered_scores = []
 
-    # 3. prompt
+    for doc, dist in zip(docs, distances):
+        similarity = 1 - dist
+
+        # ❌ remove junk chunks
+        if len(doc.strip()) < 100:
+            continue
+
+        if "section" in doc.lower() and len(doc) < 200:
+            continue
+
+        if similarity > 0.4:
+            filtered_docs.append(doc)
+            filtered_scores.append(similarity)
+
+    # 4. Fallback
+    if not filtered_docs:
+        filtered_docs = docs[:10]
+        filtered_scores = [1 - d for d in distances[:10]]
+
+    # 5. Sort by similarity
+    paired = list(zip(filtered_docs, filtered_scores))
+    paired.sort(key=lambda x: x[1], reverse=True)
+
+    # 🔹 Dynamic chunk selection
+    if broad_query:
+        top_k = 10
+    else:
+        top_k = 5
+
+    top_chunks = [p[0] for p in paired[:top_k]]
+    top_scores = [p[1] for p in paired[:top_k]]
+
+    context = "\n\n".join(top_chunks)
+
+    # 6. Prompt
     prompt = f"""
-    You are a helpful assistant.
+Answer the question using the provided context.
 
-    Answer ONLY using the context below.
-    Do NOT guess.
-    If answer is partially present, try to answer using available context.
-    Combine information from multiple parts of context if needed.
-    If the answer is not in the context, say "Not found in document."
+Instructions:
+- Do NOT use outside knowledge
+- Extract ALL relevant points from context
+- Combine information from multiple chunks
+- If question asks for "all", cover all categories found
+- If answer is incomplete, say what is missing
 
-    Context:
-    {context}
+Context:
+{context}
 
-    Question:
-    {query}
-    """
+Question:
+{query}
+"""
 
-    # 4. Groq API call
+    # 7. Groq API call
     url = "https://api.groq.com/openai/v1/chat/completions"
 
     headers = {
@@ -67,33 +102,36 @@ def answer_question(query: str):
     response = requests.post(url, headers=headers, json=data)
     result = response.json()
 
-    # Optional debug (remove later)
-    print(result)
-
     try:
         answer = result["choices"][0]["message"]["content"]
     except:
         answer = "Error generating response"
 
-    # 🔥 Best source detection (FIXED INDENT)
-    highlighted_source = None
-    for s in docs[0]:
-        if answer[:100].lower() in s.lower():
-            highlighted_source = s
-            break
+    # 8. Confidence calculation
+    if top_scores:
+        avg_similarity = sum(top_scores) / len(top_scores)
+    else:
+        avg_similarity = 0
 
-    # 🔥 Confidence
-    confidence = "high" if highlighted_source else "medium"
+    if avg_similarity > 0.75:
+        confidence = "high"
+    elif avg_similarity > 0.5:
+        confidence = "medium"
+    else:
+        confidence = "low"
 
-    # 🔥 Clean sources
+    # 9. Best source
+    best_source = top_chunks[0] if top_chunks else "Not found"
+
+    # 10. Clean sources
     clean_sources = []
-    for i, s in enumerate(docs[0]):
+    for i, s in enumerate(top_chunks):
         cleaned = " ".join(s.split())
         clean_sources.append(f"{i+1}. {cleaned[:150]}")
 
     return {
         "answer": answer,
         "sources": clean_sources,
-        "best_source": highlighted_source[:200] if highlighted_source else "Not found",
+        "best_source": best_source[:200] if best_source != "Not found" else "Not found",
         "confidence": confidence
     }

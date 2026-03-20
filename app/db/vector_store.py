@@ -1,23 +1,28 @@
 import chromadb
 import uuid
 
-client = chromadb.Client()
+client = chromadb.PersistentClient(path="./chroma_db")
 collection = client.get_or_create_collection(name="documents")
 
-
-def store_embeddings(chunks, embeddings):
+def store_embeddings(chunks, embeddings, source_file):
     for i, chunk in enumerate(chunks):
         collection.add(
             documents=[chunk],
-            embeddings=[embeddings[i]],  # ✅ FIX: correct embedding per chunk
-            ids=[str(uuid.uuid4())],     # ✅ FIX: unique id
-            metadatas=[{"source": "pdf"}]
+            embeddings=[embeddings[i]],
+            ids=[str(uuid.uuid4())],
+            metadatas=[{
+                "source": source_file,
+                "chunk_id": i
+            }]
         )
 
-
-def query_embeddings(query_embedding, n_results=8):
+def query_embeddings(query_embedding, n_results=9):
     results = collection.query(
         query_embeddings=[query_embedding],
         n_results=n_results
     )
-    return results["documents"]
+
+    return {
+        "documents": results["documents"][0],
+        "distances": results["distances"][0]
+    }
