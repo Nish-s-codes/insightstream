@@ -5,3 +5,5 @@ __pycache__/
 venv/
 .env
 data/uploads/
+chroma_db/
+chroma_db

@@ -1,28 +1,43 @@
 import fitz
 import re
+
 def extract_text(pdf_path):
     doc = fitz.open(pdf_path)
-    text = ""
-
+    pages = []
     for page in doc:
-        text += page.get_text()
+        pages.append(page.get_text())
+    return pages  # return per-page, not one big blob
 
-    return text
-
-def chunk_text(text, chunk_size=700):
-    sentences = re.split(r'(?<=[.!?]) +', text)
-
+def chunk_text(pages, chunk_size=600, overlap=100):
     chunks = []
-    current_chunk = ""
-
-    for sentence in sentences:
-        if len(current_chunk) + len(sentence) < chunk_size:
-            current_chunk += " " + sentence
-        else:
-            chunks.append(current_chunk.strip())
-            current_chunk = sentence
-
-    if current_chunk:
-        chunks.append(current_chunk.strip())
-
+    
+    for page_num, text in enumerate(pages):
+        # Normalize whitespace
+        text = re.sub(r'\n{3,}', '\n\n', text)
+        sentences = re.split(r'(?<=[.!?])\s+', text.strip())
+        
+        current_chunk = ""
+        prev_tail = ""  # overlap from previous chunk
+        
+        for sentence in sentences:
+            candidate = (prev_tail + " " + current_chunk + " " + sentence).strip()
+            
+            if len(candidate) < chunk_size:
+                current_chunk = (current_chunk + " " + sentence).strip()
+            else:
+                if current_chunk:
+                    chunks.append({
+                        "text": current_chunk,
+                        "page": page_num
+                    })
+                    # keep last ~overlap chars as context seed for next chunk
+                    prev_tail = current_chunk[-overlap:] if len(current_chunk) > overlap else current_chunk
+                current_chunk = sentence
+        
+        if current_chunk and len(current_chunk) > 80:
+            chunks.append({
+                "text": current_chunk,
+                "page": page_num
+            })
+    
     return chunks

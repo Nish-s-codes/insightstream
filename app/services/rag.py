@@ -1,137 +1,145 @@
 import requests
 import os
 from dotenv import load_dotenv
-import numpy as np
 from app.services.embed import get_embedding
 from app.db.vector_store import query_embeddings
-
 load_dotenv()
-
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
+JUNK_PATTERNS = [
+    "you may also like",
+    "notes for professionals",
+    "goalKicker",
+    "www.",
+    "http",
+    "......",
+    "chapter ",
+    "section ",
+]
+def is_junk_chunk(text: str) -> bool:
+    t = text.lower().strip()
+    # too many dots = table of contents line
+    if t.count(".") > 10:
+        return True
+    for pattern in JUNK_PATTERNS:
+        if pattern in t and len(t) < 300:
+            return True
+    return False
+
+def expand_query(query: str) -> str:
+    expansions = {
+        "disk space": "disk space df du filesystem storage usage",
+        "cpu": "cpu processor mpstat top usage",
+        "memory": "memory ram free top usage",
+        "network": "network ifconfig ip netstat",
+        "check": "check monitor status view display",
+        "process": "process ps kill top running",
+        "file": "file ls cat find grep directory",
+        "permission": "permission chmod chown access rights",
+    }
+    expanded = query
+    for keyword, terms in expansions.items():
+        if keyword in query.lower():
+            expanded += " " + terms
+    return expanded
 
 def answer_question(query: str):
-    # 🔹 Detect broad query
-    broad_query = False
-    if "all" in query.lower() or "explain" in query.lower():
-        broad_query = True
+    broad = any(kw in query.lower() for kw in ["all", "explain", "describe", "overview", "summary"])
+    top_k = 12 if broad else 6
 
-    # 1. Embed query
-    query_embedding = get_embedding(query)
-
-    # 2. Retrieve relevant chunks
-    results = query_embeddings(query_embedding)
+    query_embedding = get_embedding(expand_query(query))
+    results = query_embeddings(query_embedding, n_results=20)
 
     docs = results["documents"]
     distances = results["distances"]
 
     if not docs:
-        return {"answer": "No relevant data found"}
+        return {"answer": "No relevant data found."}
 
-    # 3. Filter + clean chunks
-    filtered_docs = []
-    filtered_scores = []
+    MIN_SIMILARITY = 0.42
+    MIN_LENGTH = 80
 
+    paired = []
     for doc, dist in zip(docs, distances):
         similarity = 1 - dist
-
-        # ❌ remove junk chunks
-        if len(doc.strip()) < 100:
+        if len(doc.strip()) < MIN_LENGTH:
             continue
-
-        if "section" in doc.lower() and len(doc) < 200:
+        if is_junk_chunk(doc):
             continue
+        if similarity < MIN_SIMILARITY:
+            continue
+        paired.append((doc, similarity))
 
-        if similarity > 0.4:
-            filtered_docs.append(doc)
-            filtered_scores.append(similarity)
+    # off-topic detection — if best match is still weak, reject
+    if not paired or max(s for _, s in paired) < 0.42:
+        return {
+            "answer": "I can only answer questions related to the uploaded documents. This question doesn't appear to be relevant to the content.",
+            "sources": [],
+            "best_source": "N/A",
+            "confidence": "none"
+        }
 
-    # 4. Fallback
-    if not filtered_docs:
-        filtered_docs = docs[:10]
-        filtered_scores = [1 - d for d in distances[:10]]
-
-    # 5. Sort by similarity
-    paired = list(zip(filtered_docs, filtered_scores))
     paired.sort(key=lambda x: x[1], reverse=True)
 
-    # 🔹 Dynamic chunk selection
-    if broad_query:
-        top_k = 10
-    else:
-        top_k = 5
-
-    top_chunks = [p[0] for p in paired[:top_k]]
+    top_docs = [p[0] for p in paired[:top_k]]
     top_scores = [p[1] for p in paired[:top_k]]
 
-    context = "\n\n".join(top_chunks)
+    context = "\n\n---\n\n".join(top_docs)
 
-    # 6. Prompt
-    prompt = f"""
-Answer the question using the provided context.
+    prompt = f"""You are a helpful assistant answering questions based on documentation excerpts.
 
-Instructions:
-- Do NOT use outside knowledge
-- Extract ALL relevant points from context
-- Combine information from multiple chunks
-- If question asks for "all", cover all categories found
-- If answer is incomplete, say what is missing
+Use the provided context as your primary source. You may use your general knowledge to clarify technical terms or fill minor gaps, but make clear what comes from the docs vs general knowledge.
 
-Context:
+If the context is irrelevant or doesn't answer the question, just say: 'I don't know based on the uploaded documents.' Do not explain what the context contains.
+
+Context from documentation:
 {context}
 
-Question:
-{query}
-"""
+Question: {query}
 
-    # 7. Groq API call
+Answer:"""
+
     url = "https://api.groq.com/openai/v1/chat/completions"
-
     headers = {
         "Authorization": f"Bearer {GROQ_API_KEY}",
         "Content-Type": "application/json"
     }
-
     data = {
         "model": "llama-3.3-70b-versatile",
-        "messages": [
-            {"role": "user", "content": prompt}
-        ]
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.2,
+        "max_tokens": 1500
     }
 
-    response = requests.post(url, headers=headers, json=data)
-    result = response.json()
-
     try:
+        response = requests.post(url, headers=headers, json=data, timeout=30)
+        response.raise_for_status()
+        result = response.json()
         answer = result["choices"][0]["message"]["content"]
-    except:
-        answer = "Error generating response"
+    except Exception as e:
+        answer = f"Error generating response: {e}"
 
-    # 8. Confidence calculation
-    if top_scores:
-        avg_similarity = sum(top_scores) / len(top_scores)
-    else:
-        avg_similarity = 0
-
-    if avg_similarity > 0.75:
+    if not top_scores:
+        confidence = "low"
+    elif max(top_scores) > 0.6:
         confidence = "high"
-    elif avg_similarity > 0.5:
+    elif max(top_scores) > 0.4:
         confidence = "medium"
     else:
         confidence = "low"
 
-    # 9. Best source
-    best_source = top_chunks[0] if top_chunks else "Not found"
+    clean_sources = [f"{i+1}. {' '.join(s.split())[:150]}" for i, s in enumerate(top_docs)]
 
-    # 10. Clean sources
-    clean_sources = []
-    for i, s in enumerate(top_chunks):
-        cleaned = " ".join(s.split())
-        clean_sources.append(f"{i+1}. {cleaned[:150]}")
+    # hide sources if LLM couldn't answer from context
+    if answer.strip().lower().startswith("i don't know"):
+        clean_sources = []
+        best_source = "N/A"
+    else:
+        best_source = top_docs[0][:200] if top_docs else "Not found"
 
     return {
         "answer": answer,
         "sources": clean_sources,
-        "best_source": best_source[:200] if best_source != "Not found" else "Not found",
+        "best_source": best_source,
         "confidence": confidence
     }
