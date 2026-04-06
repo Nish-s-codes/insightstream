@@ -18,21 +18,35 @@ def is_duplicate_chunk(text: str) -> bool:
 
 def store_embeddings(chunks, embeddings, source_file):
     skipped = 0
+    
+    docs_to_add = []
+    embs_to_add = []
+    ids_to_add = []
+    metas_to_add = []
+    
     for i, chunk in enumerate(chunks):
         if is_duplicate_chunk(chunk["text"]):
             skipped += 1
             continue
+            
+        docs_to_add.append(chunk["text"])
+        embs_to_add.append(embeddings[i])
+        ids_to_add.append(str(uuid.uuid4()))
+        metas_to_add.append({
+            "source": source_file,
+            "chunk_id": i,
+            "page": chunk.get("page", 0),
+            "hash": get_text_hash(chunk["text"])
+        })
+        
+    if docs_to_add:
         collection.add(
-            documents=[chunk["text"]],
-            embeddings=[embeddings[i]],
-            ids=[str(uuid.uuid4())],
-            metadatas=[{
-                "source": source_file,
-                "chunk_id": i,
-                "page": chunk.get("page", 0),
-                "hash": get_text_hash(chunk["text"])
-            }]
+            documents=docs_to_add,
+            embeddings=embs_to_add,
+            ids=ids_to_add,
+            metadatas=metas_to_add
         )
+        
     return skipped
 
 def query_embeddings(query_embedding, n_results=20):

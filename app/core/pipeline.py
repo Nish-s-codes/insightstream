@@ -9,6 +9,12 @@ def process_document(file_path):
         return {"error": "No text extracted"}
 
     chunks = chunk_text(pages)
+    if not chunks:
+        return {
+            "num_chunks": 0,
+            "skipped_duplicates": 0
+        }
+        
     texts = [c["text"] for c in chunks]
 
     # batch encode all at once instead of one by one

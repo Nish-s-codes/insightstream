@@ -11,33 +11,42 @@ def extract_text(pdf_path):
 def chunk_text(pages, chunk_size=600, overlap=100):
     chunks = []
     
+    current_chunk = ""
+    current_page = 0
+    
     for page_num, text in enumerate(pages):
         # Normalize whitespace
         text = re.sub(r'\n{3,}', '\n\n', text)
         sentences = re.split(r'(?<=[.!?])\s+', text.strip())
         
-        current_chunk = ""
-        prev_tail = ""  # overlap from previous chunk
-        
+        if not current_chunk:
+            current_page = page_num
+            
         for sentence in sentences:
-            candidate = (prev_tail + " " + current_chunk + " " + sentence).strip()
+            if not sentence:
+                continue
+                
+            candidate = (current_chunk + " " + sentence).strip()
             
             if len(candidate) < chunk_size:
-                current_chunk = (current_chunk + " " + sentence).strip()
+                current_chunk = candidate
             else:
                 if current_chunk:
                     chunks.append({
                         "text": current_chunk,
-                        "page": page_num
+                        "page": current_page
                     })
-                    # keep last ~overlap chars as context seed for next chunk
+                    # Use last overlap chars directly in new current_chunk
                     prev_tail = current_chunk[-overlap:] if len(current_chunk) > overlap else current_chunk
-                current_chunk = sentence
+                    current_chunk = (prev_tail + " " + sentence).strip()
+                else:
+                    current_chunk = sentence
+                current_page = page_num
         
-        if current_chunk and len(current_chunk) > 80:
-            chunks.append({
-                "text": current_chunk,
-                "page": page_num
-            })
+    if current_chunk:
+        chunks.append({
+            "text": current_chunk,
+            "page": current_page
+        })
     
     return chunks

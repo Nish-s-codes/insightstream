@@ -38,7 +38,6 @@ async def stream_response(query: str) -> AsyncGenerator[str, None]:
 
     yield "[Fetching Answer...]\n"
     await asyncio.sleep(0.5)
-
     # RAG call
     result = answer_question(query)
 
@@ -55,14 +54,12 @@ async def stream_response(query: str) -> AsyncGenerator[str, None]:
         await asyncio.sleep(0.05)
 
     yield "\n\n[Completed]\n"
-
 @router.get("/stream")
 async def stream(query: str):
     return StreamingResponse(
         stream_response(query),
         media_type="text/event-stream"
     )
-
 # -------------------- ROOT -------------------- #
 @router.get("/")
 def root():
