@@ -1,24 +1,21 @@
-import requests
+# app/services/rag.py
 import os
+from typing import AsyncGenerator
 from dotenv import load_dotenv
+from groq import AsyncGroq
 from app.services.embed import get_embedding
 from app.db.vector_store import query_embeddings
+
 load_dotenv()
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+client = AsyncGroq(api_key=os.getenv("GROQ_API_KEY"))
 
 JUNK_PATTERNS = [
-    "you may also like",
-    "notes for professionals",
-    "goalKicker",
-    "www.",
-    "http",
-    "......",
-    "chapter ",
-    "section ",
+    "you may also like", "notes for professionals", "goalKicker",
+    "www.", "http", "......", "chapter ", "section ",
 ]
+
 def is_junk_chunk(text: str) -> bool:
     t = text.lower().strip()
-    # too many dots = table of contents line
     if t.count(".") > 10:
         return True
     for pattern in JUNK_PATTERNS:
@@ -43,7 +40,8 @@ def expand_query(query: str) -> str:
             expanded += " " + terms
     return expanded
 
-def answer_question(query: str):
+def retrieve_context(query: str):
+    """Pure retrieval logic — returns docs, scores, and confidence. Sync is fine here."""
     broad = any(kw in query.lower() for kw in ["all", "explain", "describe", "overview", "summary"])
     top_k = 12 if broad else 6
 
@@ -54,7 +52,7 @@ def answer_question(query: str):
     distances = results["distances"]
 
     if not docs:
-        return {"answer": "No relevant data found."}
+        return None, [], "none"
 
     MIN_SIMILARITY = 0.42
     MIN_LENGTH = 80
@@ -70,67 +68,91 @@ def answer_question(query: str):
             continue
         paired.append((doc, similarity))
 
-    # off-topic detection — if best match is still weak, reject
     if not paired or max(s for _, s in paired) < 0.42:
-        return {
-            "answer": "I can only answer questions related to the uploaded documents. This question doesn't appear to be relevant to the content.",
-            "sources": [],
-            "best_source": "N/A",
-            "confidence": "none"
-        }
+        return None, [], "none"
 
     paired.sort(key=lambda x: x[1], reverse=True)
-
     top_docs = [p[0] for p in paired[:top_k]]
     top_scores = [p[1] for p in paired[:top_k]]
 
-    context = "\n\n---\n\n".join(top_docs)
-
-    prompt = f"""You are a helpful assistant answering questions based on documentation excerpts.
-
-Use the provided context as your primary source. You may use your general knowledge to clarify technical terms or fill minor gaps, but make clear what comes from the docs vs general knowledge.
-
-If the context is irrelevant or doesn't answer the question, just say: 'I don't know based on the uploaded documents.' Do not explain what the context contains.
-
-Context from documentation:
-{context}
-
-Question: {query}
-
-Answer:"""
-
-    url = "https://api.groq.com/openai/v1/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {GROQ_API_KEY}",
-        "Content-Type": "application/json"
-    }
-    data = {
-        "model": "llama-3.3-70b-versatile",
-        "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.2,
-        "max_tokens": 1500
-    }
-
-    try:
-        response = requests.post(url, headers=headers, json=data, timeout=30)
-        response.raise_for_status()
-        result = response.json()
-        answer = result["choices"][0]["message"]["content"]
-    except Exception as e:
-        answer = f"Error generating response: {e}"
-
-    if not top_scores:
-        confidence = "low"
-    elif max(top_scores) > 0.6:
+    if max(top_scores) > 0.6:
         confidence = "high"
     elif max(top_scores) > 0.4:
         confidence = "medium"
     else:
         confidence = "low"
 
+    return top_docs, top_scores, confidence
+
+
+async def answer_question_stream(query: str) -> AsyncGenerator[str, None]:
+    """Real streaming — yields tokens as the LLM generates them."""
+    top_docs, top_scores, confidence = retrieve_context(query)
+
+    # Send confidence metadata first
+    yield f"[CONFIDENCE: {confidence}]\n\n"
+
+    if top_docs is None:
+        yield "I can only answer questions related to the uploaded documents. This question doesn't appear to be relevant to the content."
+        return
+
+    context = "\n\n---\n\n".join(top_docs)
+    prompt = f"""You are a helpful assistant answering questions based on documentation excerpts.
+Use the provided context as your primary source. You may use your general knowledge to clarify technical terms or fill minor gaps, but make clear what comes from the docs vs general knowledge.
+If the context is irrelevant or doesn't answer the question, say: 'I don't know based on the uploaded documents.'
+
+Context from documentation:
+{context}
+
+Question: {query}
+Answer:"""
+
+    stream = await client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.2,
+        max_tokens=1500,
+        stream=True,
+    )
+
+    async for chunk in stream:
+        content = chunk.choices[0].delta.content
+        if content:
+            yield content
+
+
+async def answer_question(query: str) -> dict:
+    """Non-streaming version — kept for the /query route."""
+    top_docs, top_scores, confidence = retrieve_context(query)
+
+    if top_docs is None:
+        return {
+            "answer": "I can only answer questions related to the uploaded documents.",
+            "sources": [],
+            "best_source": "N/A",
+            "confidence": "none"
+        }
+
+    context = "\n\n---\n\n".join(top_docs)
+    prompt = f"""You are a helpful assistant answering questions based on documentation excerpts.
+Context:
+{context}
+
+Question: {query}
+Answer:"""
+
+    # For non-streaming, collect the full response
+    full_response = await client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.2,
+        max_tokens=1500,
+        stream=False,
+    )
+
+    answer = full_response.choices[0].message.content
     clean_sources = [f"{i+1}. {' '.join(s.split())[:150]}" for i, s in enumerate(top_docs)]
 
-    # hide sources if LLM couldn't answer from context
     if answer.strip().lower().startswith("i don't know"):
         clean_sources = []
         best_source = "N/A"
