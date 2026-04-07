@@ -1,23 +1,37 @@
-# terminal_chat.py
+# chat.py
+
 import httpx
+import json
 
 BASE_URL = "http://localhost:8000"
 
+
 def ask(query: str):
-    print(f"Bot: ", end="", flush=True)
+    print("Bot: ", end="", flush=True)
 
     with httpx.stream(
         "GET",
         f"{BASE_URL}/ask",
         params={"q": query},
-        timeout=60,
-        headers={"accept": "text/plain"}
+        headers={"accept": "text/event-stream"},
+        timeout=60
     ) as response:
-        for chunk in response.iter_text():
-            if "[Searching documents...]" in chunk:
-                print("(searching...) ", end="", flush=True)
+
+        for line in response.iter_lines():
+            if not line:
                 continue
-            print(chunk, end="", flush=True)
+
+            decoded = line  # ✅ FIXED
+
+            if decoded.startswith("data: "):
+                payload = decoded[6:]
+
+                try:
+                    data = json.loads(payload)
+                    text = data.get("text", "")
+                    print(text, end="", flush=True)
+                except:
+                    print(payload, end="", flush=True)
 
     print("\n")
 
@@ -38,6 +52,7 @@ def main():
         except KeyboardInterrupt:
             print("\nGoodbye!")
             break
+
 
 if __name__ == "__main__":
     main()

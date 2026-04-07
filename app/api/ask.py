@@ -1,57 +1,152 @@
 # app/api/ask.py
+
 import os
+import json
 from fastapi import APIRouter, Request
 from fastapi.responses import StreamingResponse
 from groq import AsyncGroq
 from dotenv import load_dotenv
-from app.services.mcp_client import call_search_pdfs
+from app.services.mcp_client import call_tool
 
 load_dotenv()
+
 router = APIRouter()
 groq_client = AsyncGroq(api_key=os.getenv("GROQ_API_KEY"))
 
+MODEL_NAME = "llama-3.3-70b-versatile"
+
+
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "search_pdfs",
+            "description": "Search uploaded PDF documents for technical or user-specific information.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"}
+                },
+                "required": ["query"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_repos",
+            "description": "List GitHub repositories.",
+            "parameters": {"type": "object", "properties": {}}
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_files",
+            "description": "List files in a repository.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "repo": {"type": "string"},
+                    "path": {"type": "string"}
+                },
+                "required": ["repo"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": "Read file contents from a repository.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "repo": {"type": "string"},
+                    "file_path": {"type": "string"}
+                },
+                "required": ["repo", "file_path"]
+            }
+        }
+    }
+]
+
+
+SYSTEM_PROMPT = """You are an intelligent assistant with access to external tools.
+
+You can choose to call tools when they help answer the question.
+
+Use search_pdfs when:
+- The user refers to PDFs or uploaded documents
+
+Use GitHub tools when:
+- The user asks about repositories or files
+
+Guidelines:
+- Answer directly for general knowledge
+- Use tools only when necessary
+- After calling a tool, produce a final answer
+- Avoid unnecessary repeated tool calls
+"""
+
+
 @router.get("/ask")
 async def ask(q: str, request: Request):
-
-    # check if client wants SSE (browser) or plain stream (curl/terminal)
     accept = request.headers.get("accept", "")
     use_sse = "text/event-stream" in accept
 
-    def format_chunk(text: str) -> str:
-        if use_sse:
-            return f"data: {text}\n\n"
-        return text
+    def fmt(text: str) -> str:
+        return f"data: {json.dumps({'text': text})}\n\n" if use_sse else text
 
     async def generate():
-        yield format_chunk("[Searching documents...]\n\n")
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": q}
+        ]
 
-        chunks = await call_search_pdfs(q)
+        try:
+            for _ in range(10):  # ✅ increased from 3 → 10
+                response = await groq_client.chat.completions.create(
+                    model=MODEL_NAME,
+                    messages=messages,
+                    tools=TOOLS,
+                    tool_choice="auto",
+                    temperature=0,
+                    max_tokens=1500,
+                )
 
-        if "No relevant" in chunks or "not initialized" in chunks:
-            yield format_chunk(chunks)
-            return
+                msg = response.choices[0].message
 
-        prompt = f"""You are a helpful assistant. Answer the question using only the context below.
-If the context doesn't answer the question, say: 'I don't know based on the uploaded documents.'
+                if msg.tool_calls:
+                    msg.content = None
+                    messages.append(msg)
 
-Context:
-{chunks}
+                    for tc in msg.tool_calls:
+                        tool_name = tc.function.name
 
-Question: {q}
-Answer:"""
+                        try:
+                            args = json.loads(tc.function.arguments)
+                        except:
+                            args = {}
 
-        stream = await groq_client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.2,
-            max_tokens=1500,
-            stream=True,
-        )
+                        yield fmt(f"[Calling {tool_name}...]")
 
-        async for chunk in stream:
-            content = chunk.choices[0].delta.content
-            if content:
-                yield format_chunk(content)
+                        result = await call_tool(tool_name, args, request.app)
+
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": tc.id,
+                            "content": str(result)
+                        })
+
+                    continue
+
+                if msg.content:
+                    yield fmt(msg.content)
+                    break
+
+        except Exception as e:
+            yield fmt(f"[ERROR] {str(e)}")
 
     media_type = "text/event-stream" if use_sse else "text/plain"
     return StreamingResponse(generate(), media_type=media_type)
