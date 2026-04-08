@@ -1,5 +1,3 @@
-# app/api/ask.py
-
 import os
 import json
 from fastapi import APIRouter, Request
@@ -9,23 +7,23 @@ from dotenv import load_dotenv
 from app.services.mcp_client import call_tool
 
 load_dotenv()
-
 router = APIRouter()
 groq_client = AsyncGroq(api_key=os.getenv("GROQ_API_KEY"))
 
+# Note: If you still get 429 Rate Limit errors, consider using llama-3.1-70b-versatile
 MODEL_NAME = "llama-3.3-70b-versatile"
 
-
+# ---------------- TOOLS (Fixed Schema) ----------------
 TOOLS = [
     {
         "type": "function",
         "function": {
             "name": "search_pdfs",
-            "description": "Search uploaded PDF documents for technical or user-specific information.",
+            "description": "Search through uploaded PDF documents for technical or specific information.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "query": {"type": "string"}
+                    "query": {"type": "string", "description": "The search keywords"}
                 },
                 "required": ["query"]
             }
@@ -35,7 +33,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "list_repos",
-            "description": "List GitHub repositories.",
+            "description": "List all GitHub repositories for the authenticated user.",
             "parameters": {"type": "object", "properties": {}}
         }
     },
@@ -43,12 +41,11 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "list_files",
-            "description": "List files in a repository.",
+            "description": "List all files and directories in a specific GitHub repository.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "repo": {"type": "string"},
-                    "path": {"type": "string"}
+                    "repo": {"type": "string", "description": "The name of the repository"}
                 },
                 "required": ["repo"]
             }
@@ -58,7 +55,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "read_file",
-            "description": "Read file contents from a repository.",
+            "description": "Read the text content of a specific file from a GitHub repository.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -68,27 +65,40 @@ TOOLS = [
                 "required": ["repo", "file_path"]
             }
         }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "commit_file",
+            "description": "Create or update a file in a GitHub repository.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "repo": {"type": "string"},
+                    "file_path": {"type": "string"},
+                    "content": {"type": "string"},
+                    "commit_message": {"type": "string"}
+                },
+                "required": ["repo", "file_path", "content", "commit_message"]
+            }
+        }
     }
 ]
 
+# ---------------- AGENT SYSTEM PROMPT (Pure Logic) ----------------
+SYSTEM_PROMPT = """You are a highly efficient AI Assistant with access to GitHub and PDF tools.
 
-SYSTEM_PROMPT = """You are an intelligent assistant with access to external tools.
+DECISION LOGIC:
+1. GREETINGS & SMALL TALK: If the user says 'hi', 'hola', 'who are you', or asks general questions (e.g., 'what is the capital of France'), respond DIRECTLY using your internal knowledge. Do NOT call any tools.
+2. GITHUB TASKS: Use GitHub tools ONLY if the user explicitly mentions repositories, files, or commits.
+3. PDF TASKS: Use 'search_pdfs' ONLY if the user asks about content from uploaded documents or technical documentation.
 
-You can choose to call tools when they help answer the question.
-
-Use search_pdfs when:
-- The user refers to PDFs or uploaded documents
-
-Use GitHub tools when:
-- The user asks about repositories or files
-
-Guidelines:
-- Answer directly for general knowledge
-- Use tools only when necessary
-- After calling a tool, produce a final answer
-- Avoid unnecessary repeated tool calls
+RULES:
+- Be concise.
+- Never call more than one tool at a time unless the task requires multiple steps (e.g., list files then read one).
+- If you call a tool, do not explain what you are doing first. Just call it.
+- If you have the answer, stop and provide it.
 """
-
 
 @router.get("/ask")
 async def ask(q: str, request: Request):
@@ -105,7 +115,7 @@ async def ask(q: str, request: Request):
         ]
 
         try:
-            for _ in range(10):  # ✅ increased from 3 → 10
+            for _ in range(5):  # Safety limit for tool turns
                 response = await groq_client.chat.completions.create(
                     model=MODEL_NAME,
                     messages=messages,
@@ -113,34 +123,32 @@ async def ask(q: str, request: Request):
                     tool_choice="auto",
                     temperature=0,
                     max_tokens=1500,
+                    parallel_tool_calls=False
                 )
 
                 msg = response.choices[0].message
 
+                # 1. Handle Tool Calls
                 if msg.tool_calls:
-                    msg.content = None
+                    msg.content = None # Required for API consistency
                     messages.append(msg)
 
                     for tc in msg.tool_calls:
-                        tool_name = tc.function.name
+                        t_name = tc.function.name
+                        t_args = json.loads(tc.function.arguments)
 
-                        try:
-                            args = json.loads(tc.function.arguments)
-                        except:
-                            args = {}
+                        yield fmt(f"[Calling: {t_name}...]")
 
-                        yield fmt(f"[Calling {tool_name}...]")
-
-                        result = await call_tool(tool_name, args, request.app)
+                        result = await call_tool(t_name, t_args, request.app)
 
                         messages.append({
                             "role": "tool",
                             "tool_call_id": tc.id,
                             "content": str(result)
                         })
+                    continue  # Let the LLM process the tool result
 
-                    continue
-
+                # 2. Handle Final Text Response
                 if msg.content:
                     yield fmt(msg.content)
                     break

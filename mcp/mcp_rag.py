@@ -56,6 +56,5 @@ def search_pdfs(query: str) -> str:
 
     return "\n\n---\n\n".join(formatted)
 
-
 if __name__ == "__main__":
     mcp.run()

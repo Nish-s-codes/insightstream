@@ -21,7 +21,7 @@ def ask(query: str):
             if not line:
                 continue
 
-            decoded = line  # ✅ FIXED
+            decoded = line.decode() if isinstance(line, bytes) else line
 
             if decoded.startswith("data: "):
                 payload = decoded[6:]
