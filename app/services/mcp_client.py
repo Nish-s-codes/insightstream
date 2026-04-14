@@ -1,62 +1,76 @@
 # app/services/mcp_client.py
 
+# 8000 chars ≈ 2000 tokens — large enough for a 90-line requirements.txt
+# (~5000 chars) without choking Groq's context window.
+MAX_OUTPUT_CHARS = 8000
+
+# Tools that live on the RAG server
 RAG_TOOLS = {"search_pdfs"}
 
-GITHUB_TOOLS = {
+# Tools that live on the custom GitHub server (mcp/mcp_github.py)
+CUSTOM_GITHUB_TOOLS = {
     "list_repos",
     "list_files",
     "read_file",
     "get_readme",
-    "read_repo_for_summary",
     "commit_file",
     "delete_file",
 }
 
+# Everything else goes to the official GitHub MCP (npx server).
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def extract_text(result) -> str:
+    """Pull text out of an MCP result object and truncate if needed."""
+    if not result or not hasattr(result, "content"):
+        return "[INFO] No result returned."
+
+    parts = []
+    for item in result.content:
+        if hasattr(item, "text") and item.text:
+            parts.append(item.text)
+        elif isinstance(item, dict) and "text" in item:
+            parts.append(item["text"])
+        else:
+            parts.append(str(item))
+
+    text = "\n".join(parts) if parts else "[INFO] No readable output."
+
+    if len(text) > MAX_OUTPUT_CHARS:
+        return (
+            text[:MAX_OUTPUT_CHARS]
+            + f"\n\n... [output truncated at {MAX_OUTPUT_CHARS} chars] ..."
+        )
+    return text
+
+
+# ── Main entry point ──────────────────────────────────────────────────────────
 
 async def call_tool(tool_name: str, arguments: dict, app) -> str:
-    """
-    Routes tool calls to the correct MCP server and safely parses output.
-    """
-
-    # -------- ROUTING --------
+    """Route a tool call to the correct MCP session."""
     if tool_name in RAG_TOOLS:
         session = getattr(app.state, "mcp_rag_session", None)
-        label = "RAG"
-
-    elif tool_name in GITHUB_TOOLS:
+    elif tool_name in CUSTOM_GITHUB_TOOLS:
         session = getattr(app.state, "mcp_github_session", None)
-        label = "GitHub"
-
     else:
-        return f"[ERROR] Unknown tool: {tool_name}"
+        session = getattr(app.state, "mcp_github_official", None)
+        if session is None:
+            return (
+                f"[ERROR] Official GitHub MCP is not running, "
+                f"so '{tool_name}' is unavailable. "
+                f"Check that Node.js/npx is installed."
+            )
 
-    # -------- SESSION CHECK --------
     if session is None:
-        return f"[ERROR] {label} MCP session not initialized."
+        return (
+            f"[ERROR] No active MCP session for '{tool_name}'. "
+            "Check startup logs and /debug/mcp."
+        )
 
     try:
-        # -------- TOOL EXECUTION --------
         result = await session.call_tool(tool_name, arguments=arguments)
-
-        # -------- EMPTY CHECK --------
-        if not result or not hasattr(result, "content") or not result.content:
-            return f"[INFO] {tool_name} executed but returned no data."
-
-        # -------- PARSE TEXT SAFELY --------
-        text_parts = []
-
-        for item in result.content:
-            if hasattr(item, "text") and item.text:
-                text_parts.append(item.text)
-
-            # fallback for unexpected formats
-            elif isinstance(item, dict):
-                text_parts.append(str(item))
-
-        if text_parts:
-            return "\n".join(text_parts)
-
-        return f"[INFO] {tool_name} returned data but no readable text found."
-
+        return extract_text(result)
     except Exception as e:
-        return f"[ERROR] Tool '{tool_name}' failed: {str(e)}"
+        return f"[ERROR] Tool '{tool_name}' failed: {e}"

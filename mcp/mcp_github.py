@@ -1,19 +1,20 @@
 # mcp/mcp_github.py
+# Uses httpx (async-safe) instead of requests.
+# This is your reliable custom GitHub layer.
+
 import sys
 import os
 import base64
-import requests
+import httpx
 from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
 
-# FIXED PATH BUG
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-
 load_dotenv()
 
 mcp = FastMCP("GitHub-Tool")
 
-GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
+GITHUB_TOKEN    = os.getenv("GITHUB_TOKEN")
 GITHUB_USERNAME = os.getenv("GITHUB_USERNAME")
 
 HEADERS = {
@@ -21,214 +22,166 @@ HEADERS = {
     "Accept": "application/vnd.github+json",
     "X-GitHub-Api-Version": "2022-11-28",
 }
-# ---------------- HELPERS ----------------
 
-def gh_get(url: str):
-    r = requests.get(url, headers=HEADERS)
-    r.raise_for_status()
-    return r.json()
 
-def gh_put(url: str, payload: dict):
-    r = requests.put(url, headers=HEADERS, json=payload)
-    r.raise_for_status()
-    return r.json()
+async def gh_get(url: str) -> dict | list:
+    async with httpx.AsyncClient() as client:
+        r = await client.get(url, headers=HEADERS)
+        if r.status_code >= 400:
+            return {"error": r.text, "status_code": r.status_code}
+        return r.json()
 
-def gh_delete(url: str, payload: dict):
-    r = requests.delete(url, headers=HEADERS, json=payload)
-    r.raise_for_status()
-    return r.json()
 
-# ---------------- READ TOOLS ----------------
+async def gh_put(url: str, payload: dict) -> dict:
+    async with httpx.AsyncClient() as client:
+        r = await client.put(url, headers=HEADERS, json=payload)
+        r.raise_for_status()
+        return r.json()
 
-@mcp.tool()
-def list_repos() -> str:
-    """List all repositories"""
-    try:
-        data = gh_get("https://api.github.com/user/repos?per_page=50&visibility=all")
 
-        if not data:
-            return "No repositories found."
+async def gh_delete(url: str, payload: dict) -> dict:
+    async with httpx.AsyncClient() as client:
+        r = await client.request("DELETE", url, headers=HEADERS, json=payload)
+        r.raise_for_status()
+        return r.json()
 
-        return "\n".join(
-            f"- {r['name']} ({'private' if r['private'] else 'public'})"
-            for r in data
-        )
-
-    except Exception as e:
-        return f"Error fetching repos: {str(e)}"
 
 @mcp.tool()
-def list_files(repo: str, path: str = "") -> str:
-    """List files and folders in repo"""
+async def list_repos() -> str:
+    """List all GitHub repositories belonging to the authenticated user."""
+    data = await gh_get("https://api.github.com/user/repos?per_page=100")
+    if isinstance(data, dict) and "error" in data:
+        return f"Error fetching repos: {data['error']}"
+    return "\n".join(f"- {r['name']}" for r in data)
 
+
+@mcp.tool()
+async def list_files(repo: str, path: str = "") -> str:
+    """
+    List files and folders inside a GitHub repository directory.
+
+    :param repo: Repository name (e.g. 'my-project').
+    :param path: Subdirectory path (e.g. 'src/components'). Leave empty for root.
+    """
     path = path.strip("/")
-    url = f"https://api.github.com/repos/{GITHUB_USERNAME}/{repo}/contents/{path}"
+    url  = f"https://api.github.com/repos/{GITHUB_USERNAME}/{repo}/contents/{path}"
+    data = await gh_get(url)
 
-    try:
-        data = gh_get(url)
+    if isinstance(data, dict) and "error" in data:
+        return f"Error: Could not find path '{path}' in repo '{repo}'. {data['error']}"
+    if isinstance(data, list):
+        return "\n".join(
+            f"{'[DIR] ' if i['type'] == 'dir' else '[FILE]'} {i['name']}"
+            for i in data
+        )
+    if isinstance(data, dict):
+        return f"[FILE] {data['name']}"
+    return "Not found."
 
-        if isinstance(data, list):
-            return "\n".join(
-                f"{'[DIR]' if i['type']=='dir' else '[FILE]'} {i['name']}"
-                for i in data
-            )
-
-        elif isinstance(data, dict):
-            return f"[FILE] {data['name']} (size: {data.get('size', 0)} bytes)"
-
-        return "Path not found."
-
-    except Exception as e:
-        return f"Error: {str(e)}"
 
 @mcp.tool()
-def read_file(repo: str, file_path: str) -> str:
-    """Read file content"""
+async def read_file(repo: str, file_path: str) -> str:
+    """
+    Read the text content of a file from a GitHub repository.
 
-    url = f"https://api.github.com/repos/{GITHUB_USERNAME}/{repo}/contents/{file_path}"
+    :param repo: Repository name (e.g. 'my-project').
+    :param file_path: Full path to the file (e.g. 'app/main.py').
+    """
+    url  = f"https://api.github.com/repos/{GITHUB_USERNAME}/{repo}/contents/{file_path}"
+    data = await gh_get(url)
 
-    try:
-        data = gh_get(url)
+    if isinstance(data, dict) and "error" in data:
+        return f"Error: Could not read '{file_path}' in '{repo}'. {data['error']}"
 
-        if "content" not in data:
-            return "Could not read file."
+    content = base64.b64decode(data["content"]).decode("utf-8", errors="replace")
+    return f"File: {file_path}\n\n{content}"
 
-        content = base64.b64decode(data["content"]).decode("utf-8", errors="replace")
-
-        return f"{file_path}\n\n{content}"
-
-    except Exception as e:
-        return f"Error reading file: {str(e)}"
-
-@mcp.tool()
-def get_readme(repo: str) -> str:
-    """Get README content"""
-
-    url = f"https://api.github.com/repos/{GITHUB_USERNAME}/{repo}/readme"
-
-    try:
-        data = gh_get(url)
-
-        if "content" not in data:
-            return "No README found."
-
-        return base64.b64decode(data["content"]).decode("utf-8", errors="replace")
-
-    except Exception as e:
-        return f"Error fetching README: {str(e)}"
 
 @mcp.tool()
-def read_repo_for_summary(repo: str, max_files: int = 8) -> str:
-    """Read important repo files"""
+async def get_readme(repo: str) -> str:
+    """
+    Fetch the README from a GitHub repository.
 
-    try:
-        root = gh_get(f"https://api.github.com/repos/{GITHUB_USERNAME}/{repo}/contents/")
-    except Exception as e:
-        return f"Error: {str(e)}"
+    :param repo: Repository name (e.g. 'my-project').
+    """
+    url  = f"https://api.github.com/repos/{GITHUB_USERNAME}/{repo}/readme"
+    data = await gh_get(url)
 
-    code_ext = {
-        ".py", ".js", ".ts", ".jsx", ".tsx",
-        ".java", ".go", ".rs", ".cpp", ".c",
-        ".cs", ".rb", ".php", ".html", ".css"
-    }
+    if isinstance(data, dict) and "error" in data:
+        return f"Error: No README found for '{repo}'. {data['error']}"
 
-    collected = []
+    content = base64.b64decode(data["content"]).decode("utf-8", errors="replace")
+    return f"README.md — {repo}\n\n{content}"
 
-    def collect(items, depth=0):
-        if len(collected) >= max_files:
-            return
-
-        for item in items:
-            if len(collected) >= max_files:
-                return
-
-            if item["type"] == "file":
-                ext = os.path.splitext(item["name"])[1].lower()
-
-                if ext in code_ext:
-                    try:
-                        data = gh_get(item["url"])
-                        content = base64.b64decode(data["content"]).decode("utf-8", errors="replace")
-                        collected.append(f"{item['path']}\n{content[:1500]}")
-                    except:
-                        pass
-
-            elif item["type"] == "dir" and depth < 2:
-                try:
-                    sub = gh_get(item["url"])
-                    collect(sub, depth + 1)
-                except:
-                    pass
-
-    collect(root)
-
-    if not collected:
-        return "No readable files found."
-
-    return "\n\n---\n\n".join(collected)
-
-# ---------------- WRITE TOOLS ----------------
 
 @mcp.tool()
-def commit_file(repo: str, file_path: str, content: str, commit_message: str) -> str:
-    """Create or update file"""
-
-    url = f"https://api.github.com/repos/{GITHUB_USERNAME}/{repo}/contents/{file_path}"
-
-    try:
-        existing = None
-        try:
-            existing = gh_get(url)
-        except:
-            pass
-
-        sha = existing.get("sha") if existing else None
-
-        encoded = base64.b64encode(content.encode("utf-8")).decode("utf-8")
-
-        payload = {
-            "message": commit_message,
-            "content": encoded,
-        }
-
-        if sha:
-            payload["sha"] = sha
-
-        gh_put(url, payload)
-
-        return f"{'Updated' if sha else 'Created'} {file_path}"
-
-    except Exception as e:
-        return f"Commit failed: {str(e)}"
-
-@mcp.tool()
-def delete_file(
+async def commit_file(
     repo: str,
     file_path: str,
-    commit_message: str,
-    confirmed_once: bool = False,
-    confirmed_twice: bool = False,
+    content: str,
+    commit_message: str = "Update file",
 ) -> str:
-    """Delete file (double confirmation)"""
-    if not confirmed_once:
-        return f"Confirm deletion of {file_path} (1/2)"
+    """
+    Create or update a file in a GitHub repository.
 
-    if not confirmed_twice:
-        return f"Confirm deletion of {file_path} (2/2)"
-
-    url = f"https://api.github.com/repos/{GITHUB_USERNAME}/{repo}/contents/{file_path}"
-
-    try:
-        existing = gh_get(url)
+    :param repo: Repository name.
+    :param file_path: Path where the file should be saved (e.g. 'docs/guide.md').
+    :param content: Full text content to write into the file.
+    :param commit_message: Short description for the git commit.
+    """
+    url      = f"https://api.github.com/repos/{GITHUB_USERNAME}/{repo}/contents/{file_path}"
+    existing = await gh_get(url)
+    sha      = None
+    if isinstance(existing, dict) and "error" not in existing:
         sha = existing.get("sha")
 
-        gh_delete(url, {"message": commit_message, "sha": sha})
+    payload = {
+        "message": commit_message,
+        "content": base64.b64encode(content.encode()).decode(),
+    }
+    if sha:
+        payload["sha"] = sha
 
-        return f"Deleted {file_path}"
+    try:
+        await gh_put(url, payload)
+    except httpx.HTTPStatusError as e:
+        return f"Error committing file: {e}"
 
-    except Exception as e:
-        return f"Delete failed: {str(e)}"
+    action = "Updated" if sha else "Created"
+    return f"{action} '{file_path}' in '{repo}' — commit: \"{commit_message}\""
 
-# ---------------- RUN ----------------
+
+@mcp.tool()
+async def delete_file(
+    repo: str,
+    file_path: str,
+    commit_message: str = "Delete file",
+) -> str:
+    """
+    Delete a file from a GitHub repository.
+    Only call this after the user has explicitly confirmed the deletion.
+
+    :param repo: Repository name.
+    :param file_path: Path of the file to delete (e.g. 'README.md').
+    :param commit_message: Short description for the git commit.
+    """
+    url      = f"https://api.github.com/repos/{GITHUB_USERNAME}/{repo}/contents/{file_path}"
+    existing = await gh_get(url)
+
+    if isinstance(existing, dict) and "error" in existing:
+        return f"Error: Could not find '{file_path}' in '{repo}'. {existing['error']}"
+
+    sha = existing.get("sha")
+    if not sha:
+        return f"Error: Could not retrieve SHA for '{file_path}' — cannot delete."
+
+    try:
+        await gh_delete(url, {"message": commit_message, "sha": sha})
+    except httpx.HTTPStatusError as e:
+        return f"Error deleting file: {e}"
+
+    return f"Deleted '{file_path}' from '{repo}'."
+
+
 if __name__ == "__main__":
     mcp.run()
