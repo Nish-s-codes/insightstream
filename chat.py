@@ -45,13 +45,11 @@ def run_text_mode():
             print("\nGoodbye!")
             break
 
-
 def run_voice_mode():
     import asyncio
     from app.voice.voice_client import run
     print(f"InsightStream — Voice Mode | Session: {SESSION_ID[:8]}…\n")
     asyncio.run(run(SESSION_ID))
-
 
 if __name__ == "__main__":
     if "--voice" in sys.argv:
