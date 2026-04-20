@@ -3,11 +3,16 @@ app/voice/voice_client.py
 Real-time Voice Assistant
 Pipeline: Mic -> Deepgram (WS) -> LLM (SSE) -> Cartesia (WS) -> Speakers
 
-Fixes applied vs original:
-  - Persistent OutputStream (no per-sentence open/close = no crackling)
-  - asyncio.get_running_loop() instead of deprecated get_event_loop()
-  - Barge-in flushes the audio write queue before cancelling
-  - TTS errors no longer crash the WS; CartesiaTTS auto-reconnects
+Fixes in this version:
+  1. Text prints to console immediately when LLM chunk arrives (before TTS queuing)
+  2. Sentence splitter uses \s* not \s+ — no longer waits for a space after final
+     punctuation, so the last sentence of a response is spoken without delay
+  3. VAD barge-in now uses the stricter consecutive-frame is_speech() from stt.py
+  4. Persistent OutputStream (no per-sentence open/close)
+  5. asyncio.get_running_loop() (not deprecated get_event_loop())
+  6. Clean barge-in: awaits task cancellation before starting next turn
+  7. STUTTER FIX: out_stream.write() called directly — no run_in_executor overhead
+  8. STUTTER FIX: blocksize raised 2048 -> 4096 for more buffer headroom
 """
 
 import os
@@ -33,11 +38,12 @@ load_dotenv()
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-_SENTENCE_END = re.compile(r'(?<=[.!?])\s+')
+_SENTENCE_END = re.compile(r'(?<=[.!?])\s*')
+
 BASE_URL = os.getenv("VOICE_API_BASE", "http://localhost:8000")
 
 # ---------------------------------------------------------------------------
-# Shared state  (module-level; only one active session assumed)
+# Shared state
 # ---------------------------------------------------------------------------
 mic_queue: asyncio.Queue = asyncio.Queue()
 interrupted = asyncio.Event()
@@ -45,7 +51,7 @@ bot_speaking = asyncio.Event()
 current_task: asyncio.Task | None = None
 
 # ---------------------------------------------------------------------------
-# Mic callback  (runs in sounddevice thread → must be non-blocking)
+# Mic callback  (sounddevice thread → non-blocking)
 # ---------------------------------------------------------------------------
 def mic_callback(indata, frames, time_info, status):
     if status:
@@ -55,10 +61,10 @@ def mic_callback(indata, frames, time_info, status):
 
 
 # ---------------------------------------------------------------------------
-# LLM  — SSE streaming
+# LLM — SSE streaming
 # ---------------------------------------------------------------------------
 async def ask_sse(query: str, session_id: str):
-    """Yields text chunks from the /ask SSE endpoint."""
+    """Yield raw text chunks from the /ask SSE endpoint."""
     async with httpx.AsyncClient(timeout=120) as client:
         try:
             async with client.stream(
@@ -84,36 +90,31 @@ async def ask_sse(query: str, session_id: str):
 # TTS + Playback
 # ---------------------------------------------------------------------------
 async def play_sentence(text: str, tts: CartesiaTTS, out_stream: sd.OutputStream):
-    """
-    Synthesise one sentence and write PCM chunks directly to the
-    already-open OutputStream.  No open/close per sentence → no gaps.
-    """
+    """Synthesise one sentence and write PCM into the already-open OutputStream."""
     if not text.strip() or interrupted.is_set():
         return
-
-    loop = asyncio.get_running_loop()   # FIXED: not deprecated
 
     async def on_chunk(chunk: bytes):
         if interrupted.is_set():
             return
         audio = np.frombuffer(chunk, dtype=np.int16).astype(np.float32) / 32768.0
-        # Write is blocking I/O → offload to executor so the event loop stays free
-        await loop.run_in_executor(None, out_stream.write, audio)
+        # FIX 7: write directly — run_in_executor adds thread-scheduling latency
+        # that causes gaps between chunks → stutter
+        out_stream.write(audio)
 
     await tts.stream_synthesize(text, on_chunk)
 
 
 async def speak_stream(text_iter, tts: CartesiaTTS):
     """
-    Buffer LLM chunks → split on sentence boundaries → speak each sentence.
-    One OutputStream is opened for the whole turn and closed at the end.
+    Consume LLM text chunks, print them immediately, buffer into sentences,
+    then feed each sentence to TTS as soon as it's complete.
     """
-    # FIXED: one persistent stream for the whole turn, not one per sentence
     out_stream = sd.OutputStream(
         samplerate=tts.sample_rate,
         channels=1,
         dtype="float32",
-        blocksize=2048,          # larger block → less overhead
+        blocksize=4096,   # FIX 8: was 2048 — larger buffer prevents underruns
     )
     out_stream.start()
     bot_speaking.set()
@@ -125,6 +126,7 @@ async def speak_stream(text_iter, tts: CartesiaTTS):
                 break
 
             print(chunk, end="", flush=True)
+
             buffer += chunk
 
             parts = _SENTENCE_END.split(buffer)
@@ -135,7 +137,7 @@ async def speak_stream(text_iter, tts: CartesiaTTS):
                     await play_sentence(sentence.strip(), tts, out_stream)
                 buffer = parts[-1]
 
-        # Speak any trailing fragment
+        # Speak any remaining text (e.g. a sentence without trailing punctuation)
         if buffer.strip() and not interrupted.is_set():
             await play_sentence(buffer.strip(), tts, out_stream)
 
@@ -156,7 +158,7 @@ async def handle_turn(query: str, tts: CartesiaTTS, session_id: str):
     try:
         await speak_stream(ask_sse(query, session_id), tts)
     except asyncio.CancelledError:
-        pass            # Barge-in; suppress traceback
+        pass
     except Exception as e:
         print(f"\n[Turn Error] {e}")
     finally:
@@ -176,9 +178,6 @@ async def run(session_id: str):
     dg_client = DeepgramClient()
     dg_conn = dg_client.listen.asynclive.v("1")
 
-    # -----------------------------------------------------------------------
-    # Deepgram transcript callback
-    # -----------------------------------------------------------------------
     async def on_transcript(self, result, **kwargs):
         global current_task
         if not result.channel.alternatives:
@@ -189,12 +188,11 @@ async def run(session_id: str):
             return
 
         if result.is_final and getattr(result, "speech_final", False):
-            # Barge-in: cancel ongoing turn
             if current_task and not current_task.done():
-                interrupted.set()       # Signal playback to stop writing
+                interrupted.set()
                 current_task.cancel()
                 try:
-                    await current_task  # Let cancellation propagate cleanly
+                    await current_task
                 except asyncio.CancelledError:
                     pass
 
@@ -224,24 +222,20 @@ async def run(session_id: str):
         print("Failed to connect to Deepgram.")
         return
 
-    # -----------------------------------------------------------------------
-    # Audio pump: mic → VAD barge-in check → Deepgram
-    # -----------------------------------------------------------------------
     async def audio_pump():
         while True:
             try:
                 data = await mic_queue.get()
 
-                # Barge-in detection: user speaks while bot is playing
                 if bot_speaking.is_set() and is_speech(data, VAD_THRESHOLD_WHILE_BOT_SPEAKING):
                     if not interrupted.is_set():
                         interrupted.set()
                         if current_task and not current_task.done():
                             current_task.cancel()
-                        print("\n[Barge-in detected]")
+                        print("\n[Barge-in]")
 
                 await dg_conn.send(data)
-                await asyncio.sleep(0)   # Yield to event loop
+                await asyncio.sleep(0)
 
             except asyncio.CancelledError:
                 break
@@ -251,9 +245,6 @@ async def run(session_id: str):
 
     pump_task = asyncio.create_task(audio_pump())
 
-    # -----------------------------------------------------------------------
-    # Mic input stream
-    # -----------------------------------------------------------------------
     mic_stream = sd.InputStream(
         samplerate=SAMPLE_RATE,
         channels=1,
@@ -267,12 +258,20 @@ async def run(session_id: str):
         try:
             while True:
                 await asyncio.sleep(1)
-        except KeyboardInterrupt:
+        except (KeyboardInterrupt, asyncio.CancelledError):
             print("\nShutting down...")
         finally:
             pump_task.cancel()
-            if current_task:
+            if current_task and not current_task.done():
                 current_task.cancel()
+                try:
+                    await current_task
+                except asyncio.CancelledError:
+                    pass
+            try:
+                await pump_task
+            except asyncio.CancelledError:
+                pass
             await dg_conn.finish()
             await tts.close()
 
